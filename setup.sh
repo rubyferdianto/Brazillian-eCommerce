@@ -45,20 +45,10 @@ fi
 # Install dependencies
 echo "📦 Installing Python dependencies..."
 
-# Install basic requirements first
+# Install all requirements (consolidated file)
 if [ -f requirements.txt ]; then
     pip install -r requirements.txt
-    echo "✅ Basic requirements installed"
-fi
-
-# Ask if user wants Apache Beam
-read -p "📊 Do you want to install Apache Beam for the GCS pipeline? (y/n): " install_beam
-
-if [[ $install_beam == "y" || $install_beam == "Y" ]]; then
-    if [ -f beam_requirements.txt ]; then
-        pip install -r beam_requirements.txt
-        echo "✅ Apache Beam requirements installed"
-    fi
+    echo "✅ All dependencies installed (MongoDB + Apache Beam + GCP)"
 fi
 
 # Check MongoDB connection

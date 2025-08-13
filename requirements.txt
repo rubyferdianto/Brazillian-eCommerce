@@ -1,4 +1,37 @@
-pymongo>=4.0.0
-pandas>=1.3.0
-numpy>=1.21.0
-python-dotenv>=0.19.0
+# Brazilian E-commerce Data Pipeline - All Dependencies
+# =======================================================
+# Note: Apache Beam requires Python 3.8-3.11. For Python 3.12+, use basic version without Beam.
+
+# Core Data Processing
+pandas>=1.3.0,<2.0.0
+numpy>=1.21.0,<2.0.0
+
+# MongoDB
+pymongo>=4.0.0,<5.0.0
+
+# Environment Variables
+python-dotenv>=0.19.0,<2.0.0
+
+# Apache Beam with Google Cloud Platform support
+# WARNING: Apache Beam may not work with Python 3.12+
+# For Python 3.12+, comment out the lines below and use basic MongoDB functionality only
+apache-beam[gcp]>=2.46.0,<2.50.0; python_version<"3.12"
+
+# Google Cloud Dependencies (only install if Apache Beam is compatible)
+google-cloud-storage>=2.0.0,<3.0.0; python_version<"3.12"
+google-cloud-dataflow-client>=0.8.0,<1.0.0; python_version<"3.12"
+
+# Alternative: Google Cloud Storage without Apache Beam (for newer Python versions)
+google-cloud-storage>=2.0.0,<3.0.0; python_version>="3.12"
+
+# Additional Utilities
+typing-extensions>=4.0.0
+
+# Jupyter Notebook support (if needed)
+jupyter>=1.0.0,<2.0.0
+ipykernel>=6.0.0,<7.0.0
+
+# Data Visualization (for analysis)
+matplotlib>=3.5.0,<4.0.0
+seaborn>=0.11.0,<1.0.0
+plotly>=5.0.0,<6.0.0

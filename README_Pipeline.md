@@ -8,7 +8,7 @@ This project provides a complete Apache Beam pipeline solution for extracting da
 
 ### Core Pipeline Files
 - **`mongodb_to_gcs_pipeline.py`** - Main Apache Beam pipeline code
-- **`beam_requirements.txt`** - Python dependencies for Apache Beam
+- **`requirements.txt`** - Python dependencies (MongoDB + Apache Beam + GCP)
 - **`setup.py`** - Setup configuration for Dataflow workers
 
 ### Execution Scripts
@@ -35,7 +35,7 @@ gcloud auth application-default login
 gcloud config set project YOUR_PROJECT_ID
 
 # Install Python dependencies
-pip install -r beam_requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 2. Test Your Setup

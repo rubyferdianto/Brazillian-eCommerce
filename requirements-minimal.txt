@@ -1,0 +1,17 @@
+# Minimal Requirements for Python 3.13
+# Only packages that are confirmed to work with Python 3.13
+
+# MongoDB
+pymongo>=4.0.0,<5.0.0
+
+# Environment Variables
+python-dotenv>=0.19.0,<2.0.0
+
+# Google Cloud Storage (direct, no pandas dependency)
+google-cloud-storage>=2.0.0,<3.0.0
+
+# Basic CSV processing
+csvkit>=1.0.0,<2.0.0
+
+# Utilities
+typing-extensions>=4.0.0

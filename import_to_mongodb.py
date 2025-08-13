@@ -234,7 +234,13 @@ def main():
     """Main function to run the import process"""
     
     # Configuration
-    MONGODB_URI = "mongodb+srv://rubyferdianto:lm6xwg6OJKjH6UwS@cluster0.thisg0i.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"  # Change this if your MongoDB is elsewhere
+    MONGODB_URI = os.getenv('MONGO_URI')
+    if not MONGODB_URI:
+        print("❌ Error: MONGO_URI environment variable not set!")
+        print("💡 Please create a .env file with your MongoDB connection string.")
+        print("   Example: MONGO_URI=mongodb+srv://username:password@cluster.mongodb.net/")
+        return
+    
     DATABASE_NAME = "brazilian-ecommerce"
     DATA_DIRECTORY = "data"
     

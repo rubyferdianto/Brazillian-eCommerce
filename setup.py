@@ -7,7 +7,7 @@ This file is required for Dataflow to install dependencies on worker nodes
 from setuptools import setup, find_packages
 
 # Read requirements from file
-with open('beam_requirements.txt', 'r') as f:
+with open('requirements.txt', 'r') as f:
     requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
 setup(

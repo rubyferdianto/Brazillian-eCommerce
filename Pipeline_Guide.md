@@ -33,7 +33,7 @@ source beam-env/bin/activate  # On macOS/Linux
 # beam-env\Scripts\activate  # On Windows
 
 # Install dependencies
-pip install -r beam_requirements.txt
+pip install -r requirements.txt
 ```
 
 ### 3. MongoDB Data
@@ -197,8 +197,9 @@ Google Cloud Storage
 ## 📝 File Structure
 
 ```
+```
 ├── mongodb_to_gcs_pipeline.py    # Main pipeline code
-├── beam_requirements.txt         # Python dependencies
+├── requirements.txt              # Python dependencies
 ├── setup.py                     # Setup for Dataflow workers
 ├── run_dataflow_job.sh          # Automated execution script
 └── Pipeline_Guide.md            # This documentation

@@ -35,11 +35,8 @@ DATAFLOW_MAX_WORKERS=10
 
 ### 3. Install Dependencies
 ```bash
-# For MongoDB import functionality
+# Install all dependencies (MongoDB + Apache Beam + GCP)
 pip install -r requirements.txt
-
-# For Apache Beam pipeline
-pip install -r beam_requirements.txt
 ```
 
 ## 🛡️ Security Features
