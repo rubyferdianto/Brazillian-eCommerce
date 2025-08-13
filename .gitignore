@@ -4,6 +4,12 @@
 # Data Directory
 data/
 
+# Environment Files - IMPORTANT: Contains sensitive credentials
+.env
+.env.local
+.env.*.local
+*.env
+
 # Python Cache
 __pycache__/
 *.py[cod]
