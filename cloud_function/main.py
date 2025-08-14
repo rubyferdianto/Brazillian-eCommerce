@@ -1,6 +1,7 @@
 """
 Google Cloud Function to execute MongoDB CSV export
 This function wraps our simple_csv_export.py script for use in Google Cloud Workflows
+Optimized for parallel processing and maximum performance
 """
 
 import os
@@ -15,35 +16,48 @@ import csv
 import logging
 from datetime import datetime
 from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MongoToGCSExporter:
-    """Export MongoDB collections to Google Cloud Storage as CSV files"""
+    """Export MongoDB collections to Google Cloud Storage as CSV files with parallel processing"""
     
     def __init__(self, mongo_uri: str, database_name: str = "brazilian-ecommerce"):
         self.mongo_uri = mongo_uri
         self.database_name = database_name
         self.client = None
         self.db = None
+        self.lock = threading.Lock()
         
     def connect(self) -> bool:
-        """Connect to MongoDB"""
+        """Connect to MongoDB with optimized settings"""
         try:
-            self.client = MongoClient(self.mongo_uri)
+            # Optimize MongoDB connection for high throughput
+            self.client = MongoClient(
+                self.mongo_uri,
+                maxPoolSize=20,  # Increase connection pool size
+                minPoolSize=5,
+                maxIdleTimeMS=30000,
+                socketTimeoutMS=120000,
+                connectTimeoutMS=20000,
+                serverSelectionTimeoutMS=5000
+            )
             self.db = self.client[self.database_name]
             # Test connection
             self.client.admin.command('ping')
-            logger.info(f"✅ Connected to MongoDB database: {self.database_name}")
+            logger.info(f"✅ Connected to MongoDB database: {self.database_name} with optimized settings")
             return True
         except Exception as e:
             logger.error(f"❌ MongoDB connection failed: {e}")
             return False
     
     def export_collection_to_csv(self, collection_name: str, output_path: str) -> Dict[str, Any]:
-        """Export a single collection to CSV"""
+        """Export a single collection to CSV with optimized processing"""
         try:
             collection = self.db[collection_name]
             total_docs = collection.count_documents({})
@@ -54,8 +68,9 @@ class MongoToGCSExporter:
             
             logger.info(f"📊 Exporting {total_docs:,} documents from '{collection_name}'")
             
-            # Get field names from sample documents
-            sample_docs = list(collection.find().limit(100))
+            # For very large collections, use sampling for field discovery
+            sample_size = min(1000, total_docs)
+            sample_docs = list(collection.find().limit(sample_size))
             if not sample_docs:
                 return {"success": False, "reason": "no_sample_docs", "count": 0}
             
@@ -66,26 +81,31 @@ class MongoToGCSExporter:
             
             fieldnames = sorted(list(all_fields))
             
-            # Write CSV
+            # Write CSV with optimized batch processing
             with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 
-                batch_size = 1000
+                # Use larger batch size for better performance
+                batch_size = 5000 if total_docs > 100000 else 1000
                 processed = 0
                 
-                for doc in collection.find().batch_size(batch_size):
+                # Process in batches with progress logging
+                cursor = collection.find().batch_size(batch_size)
+                
+                for doc in cursor:
                     flattened_doc = self._flatten_document(doc)
                     # Ensure all fields are present
                     row = {field: flattened_doc.get(field, '') for field in fieldnames}
                     writer.writerow(row)
                     
                     processed += 1
-                    if processed % 10000 == 0:
-                        logger.info(f"    💾 Processed: {processed:,}/{total_docs:,} documents")
+                    # More frequent progress updates for large collections
+                    if processed % (50000 if total_docs > 500000 else 10000) == 0:
+                        logger.info(f"    💾 {collection_name}: {processed:,}/{total_docs:,} documents ({processed/total_docs*100:.1f}%)")
             
             file_size = os.path.getsize(output_path)
-            logger.info(f"    ✅ Exported {processed:,} documents ({file_size / (1024*1024):.2f} MB)")
+            logger.info(f"    ✅ Exported {collection_name}: {processed:,} documents ({file_size / (1024*1024):.2f} MB)")
             
             return {
                 "success": True, 
@@ -115,6 +135,300 @@ class MongoToGCSExporter:
         
         return dict(items)
     
+    def export_collection_parallel_worker(self, collection_name: str, output_dir: str) -> Dict[str, Any]:
+        """Worker function for parallel collection export"""
+        try:
+            # Create a separate MongoDB connection for this thread
+            thread_client = MongoClient(
+                self.mongo_uri,
+                maxPoolSize=5,
+                minPoolSize=1,
+                maxIdleTimeMS=30000,
+                socketTimeoutMS=120000,
+                connectTimeoutMS=20000
+            )
+            thread_db = thread_client[self.database_name]
+            
+            output_path = os.path.join(output_dir, f"{collection_name}.csv")
+            
+            # Use the existing export logic but with thread-specific connection
+            collection = thread_db[collection_name]
+            total_docs = collection.count_documents({})
+            
+            if total_docs == 0:
+                thread_client.close()
+                return {
+                    "collection": collection_name,
+                    "status": "empty",
+                    "count": 0,
+                    "path": None
+                }
+            
+            logger.info(f"🔄 [{threading.current_thread().name}] Exporting {collection_name}: {total_docs:,} documents")
+            
+            # Get sample for field discovery
+            sample_size = min(1000, total_docs)
+            sample_docs = list(collection.find().limit(sample_size))
+            
+            if not sample_docs:
+                thread_client.close()
+                return {
+                    "collection": collection_name,
+                    "status": "error",
+                    "error": "No sample docs found"
+                }
+            
+            # Extract field names
+            all_fields = set()
+            for doc in sample_docs:
+                all_fields.update(self._flatten_document(doc).keys())
+            
+            fieldnames = sorted(list(all_fields))
+            
+            # Write CSV with optimized settings
+            start_time = time.time()
+            with open(output_path, 'w', newline='', encoding='utf-8', buffering=8192*16) as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                # Larger batch size for better performance
+                batch_size = 10000 if total_docs > 100000 else 5000
+                processed = 0
+                
+                cursor = collection.find().batch_size(batch_size)
+                
+                for doc in cursor:
+                    flattened_doc = self._flatten_document(doc)
+                    row = {field: flattened_doc.get(field, '') for field in fieldnames}
+                    writer.writerow(row)
+                    
+                    processed += 1
+                    if processed % 50000 == 0:
+                        elapsed = time.time() - start_time
+                        rate = processed / elapsed
+                        logger.info(f"    📊 [{threading.current_thread().name}] {collection_name}: {processed:,}/{total_docs:,} ({processed/total_docs*100:.1f}%) - {rate:.0f} docs/sec")
+            
+            elapsed = time.time() - start_time
+            file_size = os.path.getsize(output_path)
+            rate = processed / elapsed if elapsed > 0 else 0
+            
+            logger.info(f"✅ [{threading.current_thread().name}] Completed {collection_name}: {processed:,} docs, {file_size/(1024*1024):.2f} MB, {elapsed:.1f}s, {rate:.0f} docs/sec")
+            
+            thread_client.close()
+            
+            return {
+                "collection": collection_name,
+                "status": "success",
+                "count": processed,
+                "path": output_path,
+                "size_mb": file_size / (1024*1024),
+                "filename": f"{collection_name}.csv",
+                "duration_seconds": elapsed,
+                "rate_docs_per_second": rate
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ [{threading.current_thread().name}] Error exporting {collection_name}: {e}")
+            return {
+                "collection": collection_name,
+                "status": "error",
+                "error": str(e)
+            }
+    
+    def export_all_collections_parallel(self, output_dir: str, max_workers: int = 4) -> Dict[str, Any]:
+        """Export collections in parallel for maximum performance"""
+        try:
+            # Get all collection names and sizes
+            collection_names = self.db.list_collection_names()
+            logger.info(f"📚 Found {len(collection_names)} collections: {collection_names}")
+            
+            # Get collection sizes
+            collection_info = []
+            for name in collection_names:
+                size = self.db[name].count_documents({})
+                collection_info.append((name, size))
+            
+            # Separate small and large collections for optimal processing
+            small_collections = [(name, size) for name, size in collection_info if size < 10000]
+            large_collections = [(name, size) for name, size in collection_info if size >= 10000]
+            
+            # Sort large collections by size (largest first to start early)
+            large_collections.sort(key=lambda x: x[1], reverse=True)
+            small_collections.sort(key=lambda x: x[1])
+            
+            logger.info(f"🚀 Parallel processing strategy:")
+            logger.info(f"   Large collections ({len(large_collections)}): {[name for name, _ in large_collections]}")
+            logger.info(f"   Small collections ({len(small_collections)}): {[name for name, _ in small_collections]}")
+            
+            results = []
+            successful = 0
+            failed = 0
+            total_processed = 0
+            start_time = time.time()
+            
+            # Process large collections first (they take longest)
+            if large_collections:
+                logger.info(f"🔄 Processing {len(large_collections)} large collections with {min(max_workers, len(large_collections))} workers")
+                
+                with ThreadPoolExecutor(max_workers=min(max_workers, len(large_collections))) as executor:
+                    # Submit large collection jobs
+                    future_to_collection = {
+                        executor.submit(self.export_collection_parallel_worker, name, output_dir): name 
+                        for name, _ in large_collections
+                    }
+                    
+                    # Process results as they complete
+                    for future in as_completed(future_to_collection):
+                        collection_name = future_to_collection[future]
+                        try:
+                            result = future.result()
+                            results.append(result)
+                            
+                            if result["status"] == "success":
+                                successful += 1
+                                total_processed += result["count"]
+                            else:
+                                failed += 1
+                                
+                        except Exception as e:
+                            logger.error(f"❌ Error processing {collection_name}: {e}")
+                            results.append({
+                                "collection": collection_name,
+                                "status": "error",
+                                "error": str(e)
+                            })
+                            failed += 1
+            
+            # Process small collections (can use more workers since they're fast)
+            if small_collections:
+                logger.info(f"🔄 Processing {len(small_collections)} small collections with {max_workers} workers")
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_collection = {
+                        executor.submit(self.export_collection_parallel_worker, name, output_dir): name 
+                        for name, _ in small_collections
+                    }
+                    
+                    for future in as_completed(future_to_collection):
+                        collection_name = future_to_collection[future]
+                        try:
+                            result = future.result()
+                            results.append(result)
+                            
+                            if result["status"] == "success":
+                                successful += 1
+                                total_processed += result["count"]
+                            else:
+                                failed += 1
+                                
+                        except Exception as e:
+                            logger.error(f"❌ Error processing {collection_name}: {e}")
+                            results.append({
+                                "collection": collection_name,
+                                "status": "error",
+                                "error": str(e)
+                            })
+                            failed += 1
+            
+            total_time = time.time() - start_time
+            overall_rate = total_processed / total_time if total_time > 0 else 0
+            
+            logger.info(f"🎉 Parallel export completed: {successful} successful, {failed} failed")
+            logger.info(f"📊 Total: {total_processed:,} documents in {total_time:.1f}s ({overall_rate:.0f} docs/sec)")
+            
+            return {
+                "total_collections": len(collection_names),
+                "successful": successful,
+                "failed": failed,
+                "total_documents_processed": total_processed,
+                "total_duration_seconds": total_time,
+                "overall_rate_docs_per_second": overall_rate,
+                "results": results
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error in parallel export: {e}")
+            return {
+                "total_collections": 0,
+                "successful": 0,
+                "failed": 1,
+                "results": [],
+                "error": str(e)
+            }
+    
+    def export_all_collections(self, output_dir: str) -> Dict[str, Any]:
+        """Export all collections to CSV files with optimized ordering"""
+        try:
+            # Get all collection names
+            collection_names = self.db.list_collection_names()
+            logger.info(f"📚 Found {len(collection_names)} collections: {collection_names}")
+            
+            # Get collection sizes and sort by size (smallest first for faster feedback)
+            collection_sizes = []
+            for name in collection_names:
+                size = self.db[name].count_documents({})
+                collection_sizes.append((name, size))
+            
+            # Sort by size (smallest first)
+            collection_sizes.sort(key=lambda x: x[1])
+            
+            logger.info(f"📊 Processing order (by size):")
+            for name, size in collection_sizes:
+                logger.info(f"  - {name}: {size:,} documents")
+            
+            results = []
+            successful = 0
+            failed = 0
+            total_processed = 0
+            
+            for collection_name, expected_count in collection_sizes:
+                logger.info(f"🔄 Starting export of '{collection_name}' ({expected_count:,} documents)")
+                output_path = os.path.join(output_dir, f"{collection_name}.csv")
+                result = self.export_collection_to_csv(collection_name, output_path)
+                
+                # Convert the result format to match what the function expects
+                if result["success"]:
+                    results.append({
+                        "collection": collection_name,
+                        "status": "success",
+                        "count": result["count"],
+                        "path": output_path,
+                        "size_mb": result["size_mb"],
+                        "filename": f"{collection_name}.csv"
+                    })
+                    successful += 1
+                    total_processed += result["count"]
+                    logger.info(f"✅ Completed {collection_name}: {result['count']:,} docs, {result['size_mb']:.2f} MB")
+                else:
+                    results.append({
+                        "collection": collection_name,
+                        "status": "error",
+                        "error": result.get("error", "Unknown error")
+                    })
+                    failed += 1
+                    logger.error(f"❌ Failed {collection_name}: {result.get('error', 'Unknown error')}")
+                
+                # Progress update
+                logger.info(f"📈 Progress: {successful + failed}/{len(collection_names)} collections, {total_processed:,} total documents processed")
+            
+            return {
+                "total_collections": len(collection_names),
+                "successful": successful,
+                "failed": failed,
+                "total_documents_processed": total_processed,
+                "results": results
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error in export_all_collections: {e}")
+            return {
+                "total_collections": 0,
+                "successful": 0,
+                "failed": 1,
+                "results": [],
+                "error": str(e)
+            }
+    
     def close(self):
         """Close MongoDB connection"""
         if self.client:
@@ -122,93 +436,55 @@ class MongoToGCSExporter:
             logger.info("🔌 MongoDB connection closed")
 
 @functions_framework.http
-def mongodb_csv_exporter(request):
+def main(request):
     """
     Google Cloud Function entry point
-    Expected request body:
-    {
-        "export_folder": "exports_20240813_120000",
-        "collections": ["customers", "orders", "products"],
-        "bucket_name": "my-gcs-bucket" (optional)
-    }
     """
     try:
-        # Parse request
-        request_json = request.get_json(silent=True)
-        if not request_json:
-            return {"error": "No JSON payload provided"}, 400
-        
-        export_folder = request_json.get('export_folder', 'exports')
-        collections = request_json.get('collections', [
-            "customers", "sellers", "orders", "order_items",
-            "order_payments", "order_reviews", "products", 
-            "geolocation", "product_categories"
-        ])
-        bucket_name = request_json.get('bucket_name')
-        
-        # Get MongoDB URI from environment
+        # Get environment variables
         mongo_uri = os.getenv('MONGO_URI')
+        database_name = os.getenv('DATABASE_NAME', 'brazilian-ecommerce')
+        bucket_name = os.getenv('BUCKET_NAME', 'my_bec_bucket')
+        
         if not mongo_uri:
             return {"error": "MONGO_URI environment variable not set"}, 500
         
-        # Initialize exporter
-        exporter = MongoToGCSExporter(mongo_uri)
-        if not exporter.connect():
-            return {"error": "Failed to connect to MongoDB"}, 500
-        
-        # Create temporary directory for exports
+        # Create temporary directory for CSV files
         with tempfile.TemporaryDirectory() as temp_dir:
-            exported_files = []
-            export_summary = {"successful": 0, "failed": 0, "total_documents": 0}
+            logger.info(f"📁 Using temporary directory: {temp_dir}")
             
-            # Export each collection
-            for collection_name in collections:
-                csv_path = os.path.join(temp_dir, f"{collection_name}.csv")
-                result = exporter.export_collection_to_csv(collection_name, csv_path)
+            # Initialize exporter
+            exporter = MongoToGCSExporter(mongo_uri, database_name)
+            
+            if not exporter.connect():
+                return {"error": "Failed to connect to MongoDB"}, 500
+            
+            # Export collections using parallel processing for maximum speed
+            logger.info("🚀 Starting PARALLEL export for maximum performance")
+            export_summary = exporter.export_all_collections_parallel(temp_dir, max_workers=6)
+            logger.info(f"📊 Parallel export summary: {export_summary}")
+            
+            # Upload to GCS using parallel uploads for maximum speed
+            if export_summary['successful'] > 0:
+                successful_exports = [r for r in export_summary['results'] if r['status'] == 'success']
+                logger.info("🚀 Starting PARALLEL upload to GCS")
+                uploaded_files = upload_to_gcs_parallel(successful_exports, bucket_name, "")
                 
-                if result["success"]:
-                    exported_files.append({
-                        "collection": collection_name,
-                        "filename": f"{collection_name}.csv",
-                        "path": csv_path,
-                        "count": result["count"],
-                        "size_bytes": result["size_bytes"],
-                        "size_mb": result["size_mb"]
-                    })
-                    export_summary["successful"] += 1
-                    export_summary["total_documents"] += result["count"]
-                else:
-                    export_summary["failed"] += 1
-                    logger.error(f"Failed to export {collection_name}: {result}")
-            
-            # Upload to Google Cloud Storage if bucket specified
-            if bucket_name:
-                gcs_files = upload_to_gcs(exported_files, bucket_name, export_folder)
                 response = {
                     "status": "success",
-                    "message": f"Exported {export_summary['successful']} collections to GCS",
-                    "bucket": bucket_name,
-                    "folder": export_folder,
-                    "files": gcs_files,
-                    "summary": export_summary
+                    "message": f"PARALLEL: Exported {export_summary['successful']} collections to GCS",
+                    "files": uploaded_files,
+                    "summary": export_summary,
+                    "performance": {
+                        "total_documents": export_summary.get('total_documents_processed', 0),
+                        "total_duration_seconds": export_summary.get('total_duration_seconds', 0),
+                        "overall_rate_docs_per_second": export_summary.get('overall_rate_docs_per_second', 0)
+                    }
                 }
             else:
-                # Return file contents as base64 for workflow processing
-                file_contents = []
-                for file_info in exported_files:
-                    with open(file_info["path"], 'rb') as f:
-                        content = base64.b64encode(f.read()).decode('utf-8')
-                        file_contents.append({
-                            "filename": file_info["filename"],
-                            "content": content,
-                            "size": f"{file_info['size_mb']:.2f} MB",
-                            "count": file_info["count"]
-                        })
-                
                 response = {
-                    "status": "success",
-                    "message": f"Exported {export_summary['successful']} collections",
-                    "files": file_contents,
+                    "status": "error",
+                    "message": "No collections were successfully exported",
                     "summary": export_summary
                 }
         
@@ -219,15 +495,92 @@ def mongodb_csv_exporter(request):
         logger.error(f"Function execution failed: {e}")
         return {"error": f"Function failed: {str(e)}"}, 500
 
+def upload_file_to_gcs(file_info: Dict, bucket_name: str, folder_name: str) -> Dict:
+    """Upload a single file to GCS (worker function for parallel uploads)"""
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        
+        if folder_name:
+            blob_name = f"{folder_name}/{file_info['filename']}"
+        else:
+            blob_name = file_info['filename']
+        
+        blob = bucket.blob(blob_name)
+        
+        # Upload with optimized settings
+        start_time = time.time()
+        with open(file_info["path"], 'rb') as f:
+            blob.upload_from_file(f, content_type='text/csv')
+        
+        upload_time = time.time() - start_time
+        
+        result = {
+            "collection": file_info["collection"],
+            "filename": file_info["filename"],
+            "gcs_path": f"gs://{bucket_name}/{blob_name}",
+            "size_mb": file_info["size_mb"],
+            "count": file_info["count"],
+            "upload_time_seconds": upload_time
+        }
+        
+        logger.info(f"📁 [{threading.current_thread().name}] Uploaded {file_info['filename']} ({file_info['size_mb']:.2f}MB) in {upload_time:.1f}s")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Upload failed for {file_info.get('filename', 'unknown')}: {e}")
+        raise e
+
+def upload_to_gcs_parallel(exported_files: List[Dict], bucket_name: str, folder_name: str) -> List[Dict]:
+    """Upload exported CSV files to Google Cloud Storage in parallel"""
+    try:
+        logger.info(f"🚀 Starting parallel upload of {len(exported_files)} files to GCS")
+        start_time = time.time()
+        uploaded_files = []
+        
+        # Use parallel uploads for better performance
+        max_upload_workers = min(6, len(exported_files))
+        
+        with ThreadPoolExecutor(max_workers=max_upload_workers) as executor:
+            future_to_file = {
+                executor.submit(upload_file_to_gcs, file_info, bucket_name, folder_name): file_info
+                for file_info in exported_files
+            }
+            
+            for future in as_completed(future_to_file):
+                file_info = future_to_file[future]
+                try:
+                    result = future.result()
+                    uploaded_files.append(result)
+                except Exception as e:
+                    logger.error(f"❌ Failed to upload {file_info.get('filename', 'unknown')}: {e}")
+                    # Continue with other uploads
+        
+        total_time = time.time() - start_time
+        total_size = sum(f['size_mb'] for f in uploaded_files)
+        
+        logger.info(f"✅ Parallel upload completed: {len(uploaded_files)} files, {total_size:.2f}MB in {total_time:.1f}s")
+        
+        return uploaded_files
+        
+    except Exception as e:
+        logger.error(f"GCS parallel upload failed: {e}")
+        raise e
+
 def upload_to_gcs(exported_files: List[Dict], bucket_name: str, folder_name: str) -> List[Dict]:
-    """Upload exported CSV files to Google Cloud Storage"""
+    """Upload exported CSV files to Google Cloud Storage (fallback sequential method)"""
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
         uploaded_files = []
         
         for file_info in exported_files:
-            blob_name = f"{folder_name}/{file_info['filename']}"
+            # If folder_name is empty, upload directly to bucket root
+            if folder_name:
+                blob_name = f"{folder_name}/{file_info['filename']}"
+            else:
+                blob_name = file_info['filename']
+            
             blob = bucket.blob(blob_name)
             
             # Upload file
