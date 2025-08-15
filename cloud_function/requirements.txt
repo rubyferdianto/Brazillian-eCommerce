@@ -1,3 +1,5 @@
+pandas
+pyarrow
 functions-framework==3.*
 google-cloud-storage==2.*
 pymongo==4.*

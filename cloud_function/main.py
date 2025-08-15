@@ -1,6 +1,6 @@
 """
-Google Cloud Function to execute MongoDB CSV export
-This function wraps our simple_csv_export.py script for use in Google Cloud Workflows
+Google Cloud Function to execute MongoDB Parquet export
+This function exports MongoDB collections as Parquet files for use in Google Cloud Workflows
 Optimized for parallel processing and maximum performance
 """
 
@@ -12,7 +12,7 @@ import base64
 from google.cloud import storage
 import functions_framework
 from pymongo import MongoClient
-import csv
+
 import logging
 from datetime import datetime
 from typing import Dict, List, Any, Optional
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MongoToGCSExporter:
-    """Export MongoDB collections to Google Cloud Storage as CSV files with parallel processing"""
+    """Export MongoDB collections to Google Cloud Storage as Parquet files with parallel processing"""
     
     def __init__(self, mongo_uri: str, database_name: str = "brazilian-ecommerce"):
         self.mongo_uri = mongo_uri
@@ -56,64 +56,48 @@ class MongoToGCSExporter:
             logger.error(f"❌ MongoDB connection failed: {e}")
             return False
     
-    def export_collection_to_csv(self, collection_name: str, output_path: str) -> Dict[str, Any]:
-        """Export a single collection to CSV with optimized processing"""
+    def export_collection_to_parquet(self, collection_name: str, output_path: str) -> Dict[str, Any]:
+        """Export a single collection to Parquet with optimized processing"""
         try:
+            import pandas as pd
+            import pyarrow as pa
+            import pyarrow.parquet as pq
             collection = self.db[collection_name]
             total_docs = collection.count_documents({})
-            
             if total_docs == 0:
                 logger.warning(f"⚠️ Collection '{collection_name}' is empty")
                 return {"success": False, "reason": "empty_collection", "count": 0}
-            
             logger.info(f"📊 Exporting {total_docs:,} documents from '{collection_name}'")
-            
-            # For very large collections, use sampling for field discovery
             sample_size = min(1000, total_docs)
             sample_docs = list(collection.find().limit(sample_size))
             if not sample_docs:
                 return {"success": False, "reason": "no_sample_docs", "count": 0}
-            
-            # Extract all unique field names
             all_fields = set()
             for doc in sample_docs:
                 all_fields.update(self._flatten_document(doc).keys())
-            
             fieldnames = sorted(list(all_fields))
-            
-            # Write CSV with optimized batch processing
-            with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                # Use larger batch size for better performance
-                batch_size = 5000 if total_docs > 100000 else 1000
-                processed = 0
-                
-                # Process in batches with progress logging
-                cursor = collection.find().batch_size(batch_size)
-                
-                for doc in cursor:
-                    flattened_doc = self._flatten_document(doc)
-                    # Ensure all fields are present
-                    row = {field: flattened_doc.get(field, '') for field in fieldnames}
-                    writer.writerow(row)
-                    
-                    processed += 1
-                    # More frequent progress updates for large collections
-                    if processed % (50000 if total_docs > 500000 else 10000) == 0:
-                        logger.info(f"    💾 {collection_name}: {processed:,}/{total_docs:,} documents ({processed/total_docs*100:.1f}%)")
-            
+            batch_size = 5000 if total_docs > 100000 else 1000
+            processed = 0
+            data_rows = []
+            cursor = collection.find().batch_size(batch_size)
+            for doc in cursor:
+                flattened_doc = self._flatten_document(doc)
+                row = {field: flattened_doc.get(field, '') for field in fieldnames}
+                data_rows.append(row)
+                processed += 1
+                if processed % (50000 if total_docs > 500000 else 10000) == 0:
+                    logger.info(f"    💾 {collection_name}: {processed:,}/{total_docs:,} documents ({processed/total_docs*100:.1f}%)")
+            df = pd.DataFrame(data_rows, columns=fieldnames)
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, output_path)
             file_size = os.path.getsize(output_path)
             logger.info(f"    ✅ Exported {collection_name}: {processed:,} documents ({file_size / (1024*1024):.2f} MB)")
-            
             return {
-                "success": True, 
-                "count": processed, 
+                "success": True,
+                "count": processed,
                 "size_bytes": file_size,
                 "size_mb": file_size / (1024*1024)
             }
-            
         except Exception as e:
             logger.error(f"❌ Error exporting collection '{collection_name}': {e}")
             return {"success": False, "error": str(e), "count": 0}
@@ -136,8 +120,11 @@ class MongoToGCSExporter:
         return dict(items)
     
     def export_collection_parallel_worker(self, collection_name: str, output_dir: str) -> Dict[str, Any]:
-        """Worker function for parallel collection export"""
+        """Worker function for parallel collection export (Parquet)"""
         try:
+            import pandas as pd
+            import pyarrow as pa
+            import pyarrow.parquet as pq
             # Create a separate MongoDB connection for this thread
             thread_client = MongoClient(
                 self.mongo_uri,
@@ -148,13 +135,9 @@ class MongoToGCSExporter:
                 connectTimeoutMS=20000
             )
             thread_db = thread_client[self.database_name]
-            
-            output_path = os.path.join(output_dir, f"{collection_name}.csv")
-            
-            # Use the existing export logic but with thread-specific connection
+            output_path = os.path.join(output_dir, f"{collection_name}.parquet")
             collection = thread_db[collection_name]
             total_docs = collection.count_documents({})
-            
             if total_docs == 0:
                 thread_client.close()
                 return {
@@ -163,13 +146,9 @@ class MongoToGCSExporter:
                     "count": 0,
                     "path": None
                 }
-            
             logger.info(f"🔄 [{threading.current_thread().name}] Exporting {collection_name}: {total_docs:,} documents")
-            
-            # Get sample for field discovery
             sample_size = min(1000, total_docs)
             sample_docs = list(collection.find().limit(sample_size))
-            
             if not sample_docs:
                 thread_client.close()
                 return {
@@ -177,52 +156,39 @@ class MongoToGCSExporter:
                     "status": "error",
                     "error": "No sample docs found"
                 }
-            
-            # Extract field names
             all_fields = set()
             for doc in sample_docs:
                 all_fields.update(self._flatten_document(doc).keys())
-            
             fieldnames = sorted(list(all_fields))
-            
-            # Write CSV with optimized settings
             start_time = time.time()
-            with open(output_path, 'w', newline='', encoding='utf-8', buffering=8192*16) as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                
-                # Larger batch size for better performance
-                batch_size = 10000 if total_docs > 100000 else 5000
-                processed = 0
-                
-                cursor = collection.find().batch_size(batch_size)
-                
-                for doc in cursor:
-                    flattened_doc = self._flatten_document(doc)
-                    row = {field: flattened_doc.get(field, '') for field in fieldnames}
-                    writer.writerow(row)
-                    
-                    processed += 1
-                    if processed % 50000 == 0:
-                        elapsed = time.time() - start_time
-                        rate = processed / elapsed
-                        logger.info(f"    📊 [{threading.current_thread().name}] {collection_name}: {processed:,}/{total_docs:,} ({processed/total_docs*100:.1f}%) - {rate:.0f} docs/sec")
-            
+            batch_size = 10000 if total_docs > 100000 else 5000
+            processed = 0
+            data_rows = []
+            cursor = collection.find().batch_size(batch_size)
+            for doc in cursor:
+                flattened_doc = self._flatten_document(doc)
+                row = {field: flattened_doc.get(field, '') for field in fieldnames}
+                data_rows.append(row)
+                processed += 1
+                if processed % 50000 == 0:
+                    elapsed = time.time() - start_time
+                    rate = processed / elapsed
+                    logger.info(f"    📊 [{threading.current_thread().name}] {collection_name}: {processed:,}/{total_docs:,} ({processed/total_docs*100:.1f}%) - {rate:.0f} docs/sec")
+            df = pd.DataFrame(data_rows, columns=fieldnames)
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, output_path)
             elapsed = time.time() - start_time
             file_size = os.path.getsize(output_path)
             rate = processed / elapsed if elapsed > 0 else 0
-            
             logger.info(f"✅ [{threading.current_thread().name}] Completed {collection_name}: {processed:,} docs, {file_size/(1024*1024):.2f} MB, {elapsed:.1f}s, {rate:.0f} docs/sec")
-            
             thread_client.close()
-            
             return {
                 "collection": collection_name,
                 "status": "success",
                 "count": processed,
                 "path": output_path,
                 "size_mb": file_size / (1024*1024),
-                "filename": f"{collection_name}.csv",
+                "filename": f"{collection_name}.parquet",
                 "duration_seconds": elapsed,
                 "rate_docs_per_second": rate
             }
@@ -357,35 +323,29 @@ class MongoToGCSExporter:
             }
     
     def export_all_collections(self, output_dir: str) -> Dict[str, Any]:
-        """Export all collections to CSV files with optimized ordering"""
+        """Export all collections to Parquet files with optimized ordering"""
         try:
             # Get all collection names
             collection_names = self.db.list_collection_names()
             logger.info(f"📚 Found {len(collection_names)} collections: {collection_names}")
-            
             # Get collection sizes and sort by size (smallest first for faster feedback)
             collection_sizes = []
             for name in collection_names:
                 size = self.db[name].count_documents({})
                 collection_sizes.append((name, size))
-            
             # Sort by size (smallest first)
             collection_sizes.sort(key=lambda x: x[1])
-            
             logger.info(f"📊 Processing order (by size):")
             for name, size in collection_sizes:
                 logger.info(f"  - {name}: {size:,} documents")
-            
             results = []
             successful = 0
             failed = 0
             total_processed = 0
-            
             for collection_name, expected_count in collection_sizes:
                 logger.info(f"🔄 Starting export of '{collection_name}' ({expected_count:,} documents)")
-                output_path = os.path.join(output_dir, f"{collection_name}.csv")
-                result = self.export_collection_to_csv(collection_name, output_path)
-                
+                output_path = os.path.join(output_dir, f"{collection_name}.parquet")
+                result = self.export_collection_to_parquet(collection_name, output_path)
                 # Convert the result format to match what the function expects
                 if result["success"]:
                     results.append({
@@ -394,7 +354,7 @@ class MongoToGCSExporter:
                         "count": result["count"],
                         "path": output_path,
                         "size_mb": result["size_mb"],
-                        "filename": f"{collection_name}.csv"
+                        "filename": f"{collection_name}.parquet"
                     })
                     successful += 1
                     total_processed += result["count"]
@@ -407,10 +367,8 @@ class MongoToGCSExporter:
                     })
                     failed += 1
                     logger.error(f"❌ Failed {collection_name}: {result.get('error', 'Unknown error')}")
-                
                 # Progress update
                 logger.info(f"📈 Progress: {successful + failed}/{len(collection_names)} collections, {total_processed:,} total documents processed")
-            
             return {
                 "total_collections": len(collection_names),
                 "successful": successful,
@@ -418,7 +376,6 @@ class MongoToGCSExporter:
                 "total_documents_processed": total_processed,
                 "results": results
             }
-            
         except Exception as e:
             logger.error(f"❌ Error in export_all_collections: {e}")
             return {
@@ -449,7 +406,7 @@ def main(request):
         if not mongo_uri:
             return {"error": "MONGO_URI environment variable not set"}, 500
         
-        # Create temporary directory for CSV files
+    # Create temporary directory for Parquet files
         with tempfile.TemporaryDirectory() as temp_dir:
             logger.info(f"📁 Using temporary directory: {temp_dir}")
             
@@ -511,7 +468,7 @@ def upload_file_to_gcs(file_info: Dict, bucket_name: str, folder_name: str) -> D
         # Upload with optimized settings
         start_time = time.time()
         with open(file_info["path"], 'rb') as f:
-            blob.upload_from_file(f, content_type='text/csv')
+            blob.upload_from_file(f, content_type='application/octet-stream')
         
         upload_time = time.time() - start_time
         
@@ -532,7 +489,7 @@ def upload_file_to_gcs(file_info: Dict, bucket_name: str, folder_name: str) -> D
         raise e
 
 def upload_to_gcs_parallel(exported_files: List[Dict], bucket_name: str, folder_name: str) -> List[Dict]:
-    """Upload exported CSV files to Google Cloud Storage in parallel"""
+    """Upload exported Parquet files to Google Cloud Storage in parallel"""
     try:
         logger.info(f"🚀 Starting parallel upload of {len(exported_files)} files to GCS")
         start_time = time.time()
@@ -568,7 +525,7 @@ def upload_to_gcs_parallel(exported_files: List[Dict], bucket_name: str, folder_
         raise e
 
 def upload_to_gcs(exported_files: List[Dict], bucket_name: str, folder_name: str) -> List[Dict]:
-    """Upload exported CSV files to Google Cloud Storage (fallback sequential method)"""
+    """Upload exported Parquet files to Google Cloud Storage (fallback sequential method)"""
     try:
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
@@ -585,7 +542,7 @@ def upload_to_gcs(exported_files: List[Dict], bucket_name: str, folder_name: str
             
             # Upload file
             with open(file_info["path"], 'rb') as f:
-                blob.upload_from_file(f, content_type='text/csv')
+                blob.upload_from_file(f, content_type='application/octet-stream')
             
             uploaded_files.append({
                 "collection": file_info["collection"],
